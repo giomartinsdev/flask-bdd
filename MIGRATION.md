@@ -168,6 +168,8 @@ def <name>_bdd_client(_<name>_flask):
 
 ### 1.3 BDDConfig reference
 
+**Always use `from_env()` in test fixtures** — it starts fresh containers on random host ports:
+
 ```python
 BDDConfig.from_env(
     db_base=Base,                      # SQLAlchemy declarative base
@@ -178,7 +180,19 @@ BDDConfig.from_env(
 )
 ```
 
-`from_env` reads `DATABASE_URL` and `AWS_ENDPOINT_URL` from environment. When those vars are absent, `BDDInfra.from_config` spins up testcontainers (Docker must be running).
+`from_env()` intentionally ignores `DATABASE_URL` and `AWS_ENDPOINT_URL` environment variables. Those are app-server variables; importing them into tests pins every session to the same host port, causing conflicts when two test sessions run concurrently (locally or in parallel CI jobs). `BDDInfra.from_config` spins up testcontainers and Docker assigns random host ports automatically.
+
+**In CI with pre-provisioned services** (e.g. Docker Compose sidecar containers), use `from_ci_env()` instead:
+
+```python
+BDDConfig.from_ci_env(
+    db_base=Base,
+    db_type="sqlserver",
+    sqs_queues=["queue-name"],
+)
+```
+
+`from_ci_env()` reads `DATABASE_URL` and `AWS_ENDPOINT_URL` from the environment and skips container startup. Do not use this locally.
 
 For SQL Server use `db_type="sqlserver"` and ensure the image `flask-bdd-mssql:latest` is built:
 ```
