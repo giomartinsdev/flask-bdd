@@ -4,6 +4,8 @@ import pytest
 
 from lib.client import BDDClient
 from lib.infra import BDDInfra
+from lib.k6 import K6Runner
+from lib.server import LiveServer
 
 # ── Infrastructure (session-scoped — containers start once per test session) ──
 
@@ -114,3 +116,23 @@ def scenario_context() -> dict:
 def bdd_client(flask_app) -> Generator[BDDClient, None, None]:
     with flask_app.test_client() as raw:
         yield BDDClient(raw)
+
+
+# ── Live server + k6 (stress tests only) ──────────────────────────────────────
+
+
+@pytest.fixture(scope="session")
+def live_server(flask_app) -> Generator[LiveServer, None, None]:
+    """Start a real Werkzeug TCP server for the session; stop it on teardown.
+
+    Requires a session-scoped ``flask_app`` fixture in the module's stress conftest.
+    """
+    server = LiveServer(flask_app).start()
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="session")
+def k6_runner(live_server: LiveServer) -> K6Runner:
+    """Return a K6Runner pre-configured with the live server's BASE_URL."""
+    return K6Runner(base_url=live_server.url)

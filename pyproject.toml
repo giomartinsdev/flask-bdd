@@ -59,6 +59,7 @@ check = [
 ]
 lint = {cmd = "ruff check . --fix"}
 lint-unsafe = {cmd = "ruff check . --fix --unsafe-fixes"}
+stress = {cmd = "pytest modules/hr/stress modules/products/stress -m stress --tb=short -v"}
 
 # ============================================================
 # RUFF CONFIGURATION
@@ -107,6 +108,8 @@ ignore = [
 "modules/lib/**/*.py" = [
     "N802",    # lib functions use descriptive names
 ]
+"modules/*/stress/conftest.py" = ["E402"]
+"modules/*/stress/**/*.py" = ["S101", "PLR2004"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["hr", "products", "lib"]
@@ -178,6 +181,7 @@ filterwarnings = [
 markers = [
     "slow: marks tests as slow",
     "integration: marks tests as integration tests",
+    "stress: k6 load/stress tests — requires k6 binary installed",
 ]
 
 # ============================================================

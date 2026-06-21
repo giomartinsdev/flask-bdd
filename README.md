@@ -12,3 +12,6 @@ uv run pytest
 
 # Full check (run before commit)
 uv run ruff format . && uv run ruff check . && uv run pyright && uv run pytest
+
+# Stress tests
+uv run poe stress
