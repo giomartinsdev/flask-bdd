@@ -1,0 +1,9 @@
+flask==3.1.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+boto3==1.35.81
+pytest==8.3.4
+pytest-bdd==7.3.0
+pytest-timeout==2.3.1
+testcontainers[postgres,localstack]>=4.0
+pytest-cov==5.0.0
