@@ -5,8 +5,10 @@ Usage in a blueprint:
     from lib.openapi import schema
 
     @bp.post("")
-    @schema(request=CreateProductRequest, response=Product, status=201)
+    @schema(request=CreateProductRequest, response=Product, status=201,
+            summary="Create a product")
     def create():
+        \"\"\"Creates a new product and publishes a product.created event.\"\"\"
         ...
 
     @bp.get("")
@@ -31,7 +33,7 @@ import datetime
 import enum
 import re
 import typing
-from typing import Any, Union, get_args, get_origin
+from typing import Any, Literal, Union, get_args, get_origin
 
 
 # ── Public decorator ───────────────────────────────────────────────────────────
@@ -43,22 +45,31 @@ def schema(
     response: Any = None,
     many: bool = False,
     status: int = 200,
+    summary: str | None = None,
+    description: str | None = None,
+    deprecated: bool = False,
 ):
     """Attach OpenAPI metadata to a Flask route handler.
 
     Args:
-        request:  dataclass for the JSON request body.
-        query:    dataclass whose fields become query-string parameters.
-        response: dataclass or SQLAlchemy model returned by the endpoint.
-        many:     True when the response is a list of *response*.
-        status:   success HTTP status code.
+        request:     dataclass for the JSON request body.
+        query:       dataclass whose fields become query-string parameters.
+        response:    dataclass or SQLAlchemy model returned by the endpoint.
+        many:        True when the response is a list of *response*.
+        status:      success HTTP status code.
+        summary:     short one-line description shown in collapsed operation row.
+        description: longer description; falls back to the view function's docstring.
+        deprecated:  marks the operation as deprecated in the spec.
     """
     def decorator(func):
-        func.__openapi_request__  = request
-        func.__openapi_query__    = query
-        func.__openapi_response__ = response
-        func.__openapi_many__     = many
-        func.__openapi_status__   = status
+        func.__openapi_request__     = request
+        func.__openapi_query__       = query
+        func.__openapi_response__    = response
+        func.__openapi_many__        = many
+        func.__openapi_status__      = status
+        func.__openapi_summary__     = summary
+        func.__openapi_description__ = description
+        func.__openapi_deprecated__  = deprecated
         return func
     return decorator
 
@@ -73,6 +84,7 @@ _PY_TO_JSON: dict[type, dict] = {
     int:               {"type": "integer"},
     float:             {"type": "number"},
     bool:              {"type": "boolean"},
+    dict:              {"type": "object"},
     datetime.date:     {"type": "string", "format": "date"},
     datetime.datetime: {"type": "string", "format": "date-time"},
 }
@@ -86,27 +98,52 @@ _FLASK_CONVERTER_MAP: dict[str, dict] = {
     "any":    {"type": "string"},
 }
 
+# Shared error body registered once in components/schemas.
+_ERROR_RESPONSE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {"error": {"type": "string"}},
+    "required": ["error"],
+}
+_ERROR_REF: dict = {"$ref": "#/components/schemas/ErrorResponse"}
+
 
 # ── Endpoint metadata ──────────────────────────────────────────────────────────
 
 @dataclasses.dataclass(slots=True)
 class _EndpointMeta:
-    """@schema() attributes collected from a view function."""
+    """All @schema() attributes collected from a single view function."""
     request_cls: Any
     query_cls: Any
     response_cls: Any
     many: bool
     status: int
+    summary: str | None
+    description: str | None
+    deprecated: bool
 
     @classmethod
     def from_view(cls, func: Any) -> _EndpointMeta:
+        explicit_desc = getattr(func, "__openapi_description__", None)
         return cls(
             request_cls  = getattr(func, "__openapi_request__",  None),
             query_cls    = getattr(func, "__openapi_query__",    None),
             response_cls = getattr(func, "__openapi_response__", None),
             many         = getattr(func, "__openapi_many__",     False),
             status       = getattr(func, "__openapi_status__",   200),
+            summary      = getattr(func, "__openapi_summary__",  None),
+            description  = explicit_desc if explicit_desc is not None
+                           else _extract_docstring(func),
+            deprecated   = getattr(func, "__openapi_deprecated__", False),
         )
+
+
+def _extract_docstring(func: Any) -> str | None:
+    """Return the first non-blank line of *func*'s docstring, or None."""
+    doc = getattr(func, "__doc__", None)
+    if not doc:
+        return None
+    lines = [line.strip() for line in doc.strip().splitlines()]
+    return next((line for line in lines if line), None)
 
 
 # ── Type → JSON Schema converters ─────────────────────────────────────────────
@@ -118,15 +155,30 @@ def _annotation_to_schema(tp: Any) -> dict:
     origin = get_origin(tp)
     args   = get_args(tp)
 
+    # Literal["a", "b"] → enum of those values
+    if origin is Literal:
+        values = list(args)
+        base   = dict(_PY_TO_JSON.get(type(values[0]), {"type": "string"})) if values else {"type": "string"}
+        return {**base, "enum": values}
+
+    # Optional[X] = Union[X, None] → unwrap to X (nullability expressed via `required`)
     if origin is Union:
         non_none = [a for a in args if a is not type(None)]
         if non_none:
             return _annotation_to_schema(non_none[0])
 
+    # list[X] / List[X]
     if origin is list:
         items = _annotation_to_schema(args[0]) if args else {"type": "string"}
         return {"type": "array", "items": items}
 
+    # dict[K, V] / Dict[K, V]
+    if origin is dict:
+        if len(args) > 1:
+            return {"type": "object", "additionalProperties": _annotation_to_schema(args[1])}
+        return {"type": "object"}
+
+    # Enum subclass
     if isinstance(tp, type) and issubclass(tp, enum.Enum):
         return {"type": "string", "enum": [e.value for e in tp]}
 
@@ -230,7 +282,7 @@ def _endpoint_tag(endpoint: str) -> str:
 # ── Schema registry ────────────────────────────────────────────────────────────
 
 def _register_schema(cls: Any, defs: dict) -> dict:
-    """Ensure *cls* is in *defs* and return a ``$ref`` to it."""
+    """Ensure *cls* has an entry in *defs* and return a ``$ref`` to it."""
     name = cls.__name__
     if name not in defs:
         defs[name] = (
@@ -277,7 +329,7 @@ def _build_request_body(request_cls: Any, defs: dict) -> dict | None:
 
 
 def _build_response(response_cls: Any, many: bool, status: int, defs: dict) -> tuple[str, dict]:
-    """Return ``(status_code_str, response_object)`` for the operation."""
+    """Return ``(status_code_str, response_object)`` for the success case."""
     if response_cls is None:
         return str(status), {"description": "No content" if status == 204 else "OK"}
 
@@ -302,6 +354,13 @@ def _build_operation(
         "responses": {},
     }
 
+    if meta.summary:
+        op["summary"] = meta.summary
+    if meta.description:
+        op["description"] = meta.description
+    if meta.deprecated:
+        op["deprecated"] = True
+
     parameters = path_params + _build_query_params(meta.query_cls)
     if parameters:
         op["parameters"] = parameters
@@ -314,8 +373,14 @@ def _build_operation(
         meta.response_cls, meta.many, meta.status, defs
     )
     op["responses"][status_key] = response_obj
-    op["responses"]["400"] = {"description": "Bad request"}
-    op["responses"]["404"] = {"description": "Not found"}
+    op["responses"]["400"] = {
+        "description": "Bad request",
+        "content": {"application/json": {"schema": _ERROR_REF}},
+    }
+    op["responses"]["404"] = {
+        "description": "Not found",
+        "content": {"application/json": {"schema": _ERROR_REF}},
+    }
 
     return op
 
@@ -337,7 +402,8 @@ def build_spec(
         security_schemes: Optional OpenAPI security scheme objects; when given,
                           every operation inherits a global security requirement.
     """
-    defs: dict = {}
+    # Seed with the shared error schema so all 400/404 refs resolve.
+    defs: dict = {"ErrorResponse": _ERROR_RESPONSE_SCHEMA}
     seen_tags: list[str] = []
     paths: dict = {}
 

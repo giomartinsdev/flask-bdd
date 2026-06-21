@@ -243,12 +243,7 @@ All steps for a module live in one file: `tests/<name>_steps.py`.
 import json
 import pytest
 from pytest_bdd import given, when, then, parsers
-from lib.assertions import assert_status, assert_error_contains, assert_sqs_message
-
-
-@pytest.fixture
-def <name>_context():
-    return {}
+from lib.assertions import assert_status, assert_json_body, assert_error_contains, assert_sqs_message
 
 
 # ── Given ─────────────────────────────────────────────────────────────────────
@@ -259,43 +254,42 @@ def things_empty():
 
 
 @given(parsers.parse('a thing exists with name "{name}"'))
-def thing_exists(<name>_bdd_client, <name>_context, name):
+def thing_exists(<name>_bdd_client, scenario_context, name):
     resp = <name>_bdd_client.json_post("/things", {"name": name})
     assert resp.status_code == 201, f"setup failed: {resp.data}"
-    <name>_context.setdefault("things", {})[name] = json.loads(resp.data)
+    scenario_context.setdefault("things", {})[name] = json.loads(resp.data)
 
 
 # ── When ──────────────────────────────────────────────────────────────────────
 
 @when(parsers.parse('I create a thing with name "{name}"'))
-def create_thing(<name>_bdd_client, <name>_context, name):
-    <name>_context["response"] = <name>_bdd_client.json_post("/things", {"name": name})
-    if <name>_context["response"].status_code == 201:
-        body = json.loads(<name>_context["response"].data)
-        <name>_context.setdefault("things", {})[name] = body
+def create_thing(<name>_bdd_client, scenario_context, name):
+    scenario_context["response"] = <name>_bdd_client.json_post("/things", {"name": name})
+    if scenario_context["response"].status_code == 201:
+        body = json.loads(scenario_context["response"].data)
+        scenario_context.setdefault("things", {})[name] = body
 
 
 @when("I list all things")
-def list_things(<name>_bdd_client, <name>_context):
-    <name>_context["response"] = <name>_bdd_client.get("/things")
+def list_things(<name>_bdd_client, scenario_context):
+    scenario_context["response"] = <name>_bdd_client.get("/things")
 
 
 # ── Then ──────────────────────────────────────────────────────────────────────
 
 @then(parsers.parse("the response status is {status:d}"))
-def check_status(<name>_context, status):
-    assert_status(<name>_context["response"], status)
+def check_status(scenario_context, status):
+    assert_status(scenario_context["response"], status)
 
 
 @then(parsers.parse('the thing name is "{name}"'))
-def check_name(<name>_context, name):
-    body = json.loads(<name>_context["response"].data)
-    assert body.get("name") == name, f"expected name={name!r}, got {body.get('name')!r}"
+def check_name(scenario_context, name):
+    assert_json_body(scenario_context["response"], name=name)
 
 
 @then(parsers.parse('the error contains "{fragment}"'))
-def check_error(<name>_context, fragment):
-    assert_error_contains(<name>_context["response"], fragment)
+def check_error(scenario_context, fragment):
+    assert_error_contains(scenario_context["response"], fragment)
 
 
 @then(parsers.parse('an SQS message with event "{event_type}" is in the queue'))
@@ -326,26 +320,45 @@ No test functions. `scenarios()` generates one test per Scenario block.
 ### 1.7 BDDClient reference
 
 ```python
-client.get(path)                      # GET
+client.get(path)                      # GET → TestResponse
+client.get_json(path)                 # GET → parsed dict (skips TestResponse)
 client.json_post(path, body_dict)     # POST  application/json
 client.json_put(path, body_dict)      # PUT   application/json
 client.json_patch(path, body_dict)    # PATCH application/json
-client.delete(path)                   # DELETE
+client.delete(path)                   # DELETE (no body)
+client.json_delete(path, body_dict)   # DELETE application/json (for APIs that accept a body)
 ```
-
-Returns the raw Flask `TestResponse`. Access `.status_code` and `.data`.
 
 ### 1.8 Assertions reference
 
 ```python
-from lib.assertions import assert_status, assert_field, assert_error_contains, assert_sqs_message, assert_s3_object_exists
+from lib.assertions import (
+    assert_status, assert_field, assert_json_body, assert_error_contains,
+    assert_sqs_message, assert_no_sqs_message,
+    assert_sns_message, assert_no_sns_message,
+    assert_s3_object_exists, assert_s3_object_contains,
+)
 
+# HTTP
 assert_status(response, 201)
-assert_field(response, "name", "Widget")
+assert_field(response, "name", "Widget")                   # one field
+assert_json_body(response, name="Widget", active=True)     # multiple fields at once; returns body dict
 assert_error_contains(response, "duplicate")
-assert_sqs_message(sqs_client, queue_url, "thing.created")   # polls up to 10×
+
+# SQS — direct events
+assert_sqs_message(sqs_client, queue_url, "thing.created", timeout=5.0)   # deadline loop, long-poll
+assert_no_sqs_message(sqs_client, queue_url, "thing.created", wait=1.0)   # assert absent
+
+# SNS — via capture queue auto-created by BDDInfra
+assert_sns_message(sqs_client, infra.sns_capture_urls["my-topic"], "Low stock alert", timeout=5.0)
+assert_no_sns_message(sqs_client, infra.sns_capture_urls["my-topic"], "Low stock alert")
+
+# S3
 assert_s3_object_exists(s3_client, "bucket", "some/key.txt")
+assert_s3_object_contains(s3_client, "bucket", "some/key.txt", "expected fragment")
 ```
+
+**`assert_sqs_message` changed from `retries=10` to `timeout=5.0` (seconds).** Update any call sites that passed `retries` as a keyword argument.
 
 ### 1.9 Table truncation
 
@@ -452,6 +465,11 @@ All parameters are keyword-only:
 | `response` | dataclass or SQLAlchemy model | `None` | Response body schema |
 | `many` | `bool` | `False` | Wrap response schema in `{"type": "array", "items": ...}` |
 | `status` | `int` | `200` | Success HTTP status code emitted in the spec |
+| `summary` | `str` | `None` | Short one-line label shown in the collapsed operation row |
+| `description` | `str` | `None` | Longer description; falls back to the view function's docstring automatically |
+| `deprecated` | `bool` | `False` | Marks the operation as deprecated in the spec and Swagger UI |
+
+**Docstring auto-extraction:** if `description` is not passed to `@schema()`, the first line of the view function's docstring is used automatically. No extra annotation needed if the docstring already exists.
 
 ### 2.3 Request/response schemas
 
@@ -498,12 +516,17 @@ class ThingFilters:              # used with query=
 | `int` | `{"type": "integer"}` |
 | `float` | `{"type": "number"}` |
 | `bool` | `{"type": "boolean"}` |
+| `dict` | `{"type": "object"}` |
+| `dict[K, V]` / `Dict[K, V]` | `{"type": "object", "additionalProperties": <V schema>}` |
 | `datetime.date` | `{"type": "string", "format": "date"}` |
 | `datetime.datetime` | `{"type": "string", "format": "date-time"}` |
 | `Optional[X]` | same as `X` (nullability expressed via `required` list, not `nullable`) |
 | `list[X]` / `List[X]` | `{"type": "array", "items": <X schema>}` |
+| `Literal["a", "b"]` | `{"type": "string", "enum": ["a", "b"]}` |
 | `enum.Enum` subclass | `{"type": "string", "enum": [values...]}` |
 | anything else | `{"type": "string"}` |
+
+**Error responses:** every operation automatically includes `400` and `404` responses that reference a shared `ErrorResponse` component schema (`{"error": "string"}`). No per-route annotation needed.
 
 SQLAlchemy model columns are converted via `model_to_schema()` which inspects column types. Both approaches produce a `$ref` in `components/schemas`.
 

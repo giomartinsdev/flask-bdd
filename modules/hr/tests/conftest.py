@@ -114,3 +114,9 @@ def _hr_flask(_hr_infra):
 def hr_bdd_client(_hr_flask):
     with _hr_flask.test_client() as raw:
         yield BDDClient(raw)
+
+
+@pytest.fixture
+def hr_db_seed(_hr_infra):
+    with _hr_infra.seed_session() as session:
+        yield session

@@ -1,6 +1,7 @@
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 
 import boto3
 from sqlalchemy import Engine, create_engine, text
@@ -20,13 +21,65 @@ class BDDInfra:
     aws_endpoint: str
     queue_urls: Dict[str, str] = field(default_factory=dict)
     topic_arns: Dict[str, str] = field(default_factory=dict)
+    # Auto-created per SNS topic: {topic_name: capture_queue_url}
+    # Each capture queue is subscribed to its topic so SNS publishes can be asserted via SQS.
+    sns_capture_urls: Dict[str, str] = field(default_factory=dict)
     _containers: List[Any] = field(default_factory=list, repr=False)
 
     def make_session(self) -> Session:
         return sessionmaker(bind=self.db_engine)()
 
+    # ── Seeding ────────────────────────────────────────────────────────────────
+
+    def seed(self, *objects: Any) -> None:
+        """Insert and immediately commit one or more ORM objects.
+
+        Use for simple, flat seed data where you don't need to inspect
+        auto-generated IDs before committing:
+
+            infra.seed(
+                Category(name="Electronics"),
+                Category(name="Books"),
+            )
+        """
+        session = self.make_session()
+        try:
+            for obj in objects:
+                session.add(obj)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    @contextmanager
+    def seed_session(self) -> Generator[Session, None, None]:
+        """Context manager that yields an open session for complex seeding.
+
+        Commits on clean exit, rolls back on exception, always closes.
+        Use when you need to read back auto-generated IDs mid-seed or build
+        objects that reference each other:
+
+            with infra.seed_session() as s:
+                area = Area(name="Engineering")
+                s.add(area)
+                s.flush()                        # populate area.id without committing
+                s.add(Employee(name="Alice", area_id=area.id))
+            # committed here
+        """
+        session = self.make_session()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def drain_all_queues(self) -> None:
-        for url in self.queue_urls.values():
+        for url in list(self.queue_urls.values()) + list(self.sns_capture_urls.values()):
             _drain_queue(self.sqs, url)
 
     def truncate_tables(self, *table_names: str) -> None:
@@ -68,7 +121,7 @@ class BDDInfra:
         )
         sqs = boto3.client("sqs", **boto_kwargs)
         sns = boto3.client("sns", **boto_kwargs)
-        s3 = boto3.client("s3", **boto_kwargs)
+        s3  = boto3.client("s3",  **boto_kwargs)
 
         queue_urls: Dict[str, str] = {}
         for name in config.sqs_queues:
@@ -82,6 +135,19 @@ class BDDInfra:
         for name in config.s3_buckets:
             s3.create_bucket(Bucket=name)
 
+        # For each SNS topic, create a dedicated capture queue and subscribe it.
+        # Tests can poll infra.sns_capture_urls[topic_name] via assert_sns_message().
+        sns_capture_urls: Dict[str, str] = {}
+        for topic_name, topic_arn in topic_arns.items():
+            capture_name = f"{topic_name}-capture"
+            sqs.create_queue(QueueName=capture_name)
+            capture_url = sqs.get_queue_url(QueueName=capture_name)["QueueUrl"]
+            capture_arn = sqs.get_queue_attributes(
+                QueueUrl=capture_url, AttributeNames=["QueueArn"]
+            )["Attributes"]["QueueArn"]
+            sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=capture_arn)
+            sns_capture_urls[topic_name] = capture_url
+
         return cls(
             config=config,
             db_url=db_url,
@@ -92,14 +158,16 @@ class BDDInfra:
             aws_endpoint=aws_endpoint,
             queue_urls=queue_urls,
             topic_arns=topic_arns,
+            sns_capture_urls=sns_capture_urls,
             _containers=containers,
         )
 
 
+# ── Table truncation ───────────────────────────────────────────────────────────
+
 def _sqlserver_truncate(conn, table_names) -> None:
     # Collect all FK constraints that need to be disabled upfront — including
-    # cross-table incoming FKs — to handle circular references (e.g. employees
-    # ↔ areas).  Disable all, delete all, then re-enable all once tables are empty.
+    # cross-table incoming FKs — to handle circular references (e.g. employees ↔ areas).
     to_disable: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -139,10 +207,11 @@ def _sqlserver_truncate(conn, table_names) -> None:
         if has_identity:
             conn.execute(text(f"DBCC CHECKIDENT ('{table}', RESEED, 0)"))
 
-    # Tables are now empty — re-enable with CHECK is safe
     for (tbl, fk) in to_disable:
         conn.execute(text(f"ALTER TABLE [{tbl}] WITH CHECK CHECK CONSTRAINT [{fk}]"))
 
+
+# ── Container launchers ────────────────────────────────────────────────────────
 
 def _start_postgres(config: BDDConfig, containers: list) -> str:
     from testcontainers.postgres import PostgresContainer
@@ -183,6 +252,8 @@ def _start_localstack(config: BDDConfig, containers: list) -> str:
     containers.append(ls)
     return ls.get_url()
 
+
+# ── Queue drain ────────────────────────────────────────────────────────────────
 
 def _drain_queue(sqs_client: Any, queue_url: str) -> None:
     while True:

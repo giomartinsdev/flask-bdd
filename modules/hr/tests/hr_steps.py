@@ -19,6 +19,21 @@ def company_empty():
     pass
 
 
+@given(parsers.parse('the areas "{area1}" and "{area2}" are seeded directly in the database'))
+def seed_two_areas_in_db(hr_db_seed, hr_context, area1, area2):
+    from hr.domain.area.model import Area
+    a1 = Area(name=area1)
+    a2 = Area(name=area2)
+    hr_db_seed.add(a1)
+    hr_db_seed.add(a2)
+    hr_db_seed.flush()   # assign DB-generated IDs without committing
+    hr_context["areas"] = {
+        area1: {"id": a1.id, "name": area1},
+        area2: {"id": a2.id, "name": area2},
+    }
+    hr_db_seed.commit()  # make rows visible to subsequent HTTP requests
+
+
 @given(parsers.parse('an area exists with name "{name}"'))
 def area_exists(hr_bdd_client, hr_context, name):
     resp = hr_bdd_client.json_post("/areas", {"name": name})
@@ -295,6 +310,19 @@ def check_employee_area(hr_context, area_name):
     area = hr_context.get("areas", {}).get(area_name)
     assert area is not None
     body = json.loads(hr_context["response"].data)
+    assert body.get("area_id") == area["id"], (
+        f"expected area_id={area['id']}, got {body.get('area_id')}"
+    )
+
+
+@then(parsers.parse('employee "{email}" is confirmed in area "{area_name}" via GET'))
+def confirm_employee_area_via_get(hr_bdd_client, hr_context, email, area_name):
+    emp = hr_context["employees"][email]
+    area = hr_context.get("areas", {}).get(area_name)
+    assert area is not None
+    resp = hr_bdd_client.get(f"/employees/{emp['id']}")
+    assert resp.status_code == 200, f"GET /employees/{emp['id']} failed: {resp.data}"
+    body = json.loads(resp.data)
     assert body.get("area_id") == area["id"], (
         f"expected area_id={area['id']}, got {body.get('area_id')}"
     )
